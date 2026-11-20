@@ -70,6 +70,21 @@ def _print_payload(payload: dict[str, object], as_json: bool) -> None:
         print(f"Backup: {payload['backup_path']}")
 
 
+def _emit_error(code: str, message: str, as_json: bool) -> None:
+    if as_json:
+        print(
+            json.dumps({"error": {"code": code, "message": message}}, ensure_ascii=False),
+            file=sys.stderr,
+        )
+    else:
+        print(f"error [{code}]: {message}", file=sys.stderr)
+
+
+def _describe_os_error(error: OSError) -> str:
+    detail = error.strerror or str(error)
+    return f"{detail}: {error.filename}" if error.filename else detail
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -94,13 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         _print_payload(payload, args.json)
         return 0
     except RescueError as error:
-        if args.json:
-            print(
-                json.dumps({"error": {"code": error.code, "message": str(error)}}, ensure_ascii=False),
-                file=sys.stderr,
-            )
-        else:
-            print(f"error [{error.code}]: {error}", file=sys.stderr)
+        _emit_error(error.code, str(error), args.json)
+        return 1
+    except OSError as error:
+        _emit_error("io_error", _describe_os_error(error), args.json)
         return 1
 
 

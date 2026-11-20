@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from tests.fixtures import SESSION_ID, create_source_db, create_target_db
 from zcode_session_rescue.cli import main
@@ -144,6 +145,25 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("usage:", result.stderr)
+
+    def test_filesystem_error_reports_io_error(self):
+        error = PermissionError(13, "Permission denied", "locked.sqlite")
+        with mock.patch("zcode_session_rescue.cli.list_sessions", side_effect=error):
+            code, output, stderr = self.invoke("list", "--source", "locked.sqlite")
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("io_error", stderr)
+        self.assertIn("locked.sqlite", stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_filesystem_error_json_shape(self):
+        error = OSError(28, "No space left on device", "target.sqlite")
+        with mock.patch("zcode_session_rescue.cli.list_sessions", side_effect=error):
+            code, _, stderr = self.invoke("list", "--source", "target.sqlite", "--json")
+        self.assertEqual(code, 1)
+        payload = json.loads(stderr)
+        self.assertEqual(payload["error"]["code"], "io_error")
+        self.assertIn("No space left on device", payload["error"]["message"])
 
 
 if __name__ == "__main__":
