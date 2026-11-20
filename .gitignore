@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.coverage
+htmlcov/
+.superpowers/
+.verification/
+operations/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
