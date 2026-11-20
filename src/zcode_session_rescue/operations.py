@@ -17,7 +17,7 @@ from .planner import (
     build_restore_plan,
     database_fingerprint,
 )
-from .receipt import atomic_write_json, decode_typed_value, read_json
+from .receipt import atomic_write_json, decode_typed_value, read_json, restrict_to_owner
 from .relations import (
     foreign_key_groups,
     query_column_values,
@@ -65,6 +65,7 @@ def _operation_directory(parent: Path, action: str, operation_id: str) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = parent / f"{action}-{stamp}-{operation_id}"
     directory.mkdir(parents=True, exist_ok=False)
+    restrict_to_owner(directory, 0o700)
     return directory
 
 
@@ -80,6 +81,7 @@ def backup_database(target: str | Path, destination: str | Path) -> Path:
         result = backup.execute("PRAGMA quick_check").fetchone()
         if not result or result[0] != "ok":
             raise RescueError("Backup failed SQLite quick_check", "backup_invalid")
+        restrict_to_owner(backup_path)
         return backup_path
     except sqlite3.Error as error:
         raise RescueError(f"Cannot back up target database: {error}", "backup_failed") from error

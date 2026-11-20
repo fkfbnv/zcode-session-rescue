@@ -28,6 +28,13 @@ def decode_typed_value(payload: dict[str, object]) -> object:
     raise RescueError(f"Receipt contains an unknown value type: {kind}", "receipt_invalid")
 
 
+def restrict_to_owner(path: str | Path, mode: int = 0o600) -> None:
+    """On POSIX, keep backups and receipts readable only by their owner."""
+    if os.name != "posix":
+        return
+    os.chmod(path, mode)
+
+
 def atomic_write_json(path: str | Path, payload: dict[str, object]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +54,7 @@ def atomic_write_json(path: str | Path, payload: dict[str, object]) -> None:
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_name, destination)
+        restrict_to_owner(destination)
     finally:
         if temporary_name and os.path.exists(temporary_name):
             os.unlink(temporary_name)

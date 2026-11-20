@@ -6,8 +6,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.fixtures import OTHER_SESSION_ID, SESSION_ID, create_source_db, create_target_db
+from zcode_session_rescue import operations
 from zcode_session_rescue.errors import RescueError
 from zcode_session_rescue.operations import restore_session, undo_restore
 from zcode_session_rescue.planner import (
@@ -240,6 +242,143 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(sorted([first.returncode, second.returncode]), [0, 1])
         receipt = json.loads(restored.receipt_path.read_text(encoding="utf-8"))
         self.assertEqual(receipt["status"], "undone")
+
+    def _add_side_table(self, statement: str, row: tuple | None = None) -> None:
+        for path in (self.source, self.target):
+            conn = sqlite3.connect(path)
+            conn.execute(statement)
+            conn.commit()
+            conn.close()
+        if row is not None:
+            table = statement.split()[2]
+            columns = ", ".join("?" for _ in row)
+            conn = sqlite3.connect(self.source)
+            conn.execute(f"INSERT INTO {table} VALUES ({columns})", row)
+            conn.commit()
+            conn.close()
+
+    def test_blob_primary_key_round_trip(self):
+        self._add_side_table(
+            "CREATE TABLE blob_keyed (key BLOB PRIMARY KEY, session_id TEXT, payload TEXT)",
+            (sqlite3.Binary(b"\x00\xffblob-key"), SESSION_ID, "blob payload"),
+        )
+        restored = restore_session(self.source, self.target, SESSION_ID, self.operations, apply=True)
+
+        conn = sqlite3.connect(self.target)
+        stored = conn.execute("SELECT key, payload FROM blob_keyed").fetchone()
+        conn.close()
+        self.assertEqual(bytes(stored[0]), b"\x00\xffblob-key")
+        self.assertEqual(stored[1], "blob payload")
+
+        undo_restore(restored.receipt_path, apply=True)
+        conn = sqlite3.connect(self.target)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM blob_keyed").fetchone()[0], 0)
+        conn.close()
+
+    def test_unicode_primary_key_round_trip(self):
+        key = "会话·🔑·ключ"
+        self._add_side_table(
+            "CREATE TABLE unicode_keyed (key TEXT PRIMARY KEY, session_id TEXT, payload TEXT)",
+            (key, SESSION_ID, "unicode payload"),
+        )
+        restored = restore_session(self.source, self.target, SESSION_ID, self.operations, apply=True)
+
+        conn = sqlite3.connect(self.target)
+        stored = conn.execute("SELECT key FROM unicode_keyed").fetchone()
+        conn.close()
+        self.assertEqual(stored[0], key)
+
+        undo_restore(restored.receipt_path, apply=True)
+        conn = sqlite3.connect(self.target)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM unicode_keyed").fetchone()[0], 0)
+        conn.close()
+
+    def test_interrupted_insert_rolls_back_without_residue(self):
+        original = operations.connect_existing
+        counter = {"steps": 0}
+
+        def connect_with_interrupt(path):
+            conn = original(path)
+            if Path(path).resolve() == self.target.resolve():
+                def handler():
+                    counter["steps"] += 1
+                    return 1 if counter["steps"] > 4 else 0
+
+                conn.set_progress_handler(handler, 100)
+            return conn
+
+        with mock.patch.object(operations, "connect_existing", connect_with_interrupt):
+            with self.assertRaises(RescueError) as raised:
+                restore_session(self.source, self.target, SESSION_ID, self.operations, apply=True)
+
+        self.assertEqual(raised.exception.code, "restore_failed")
+        conn = sqlite3.connect(self.target)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session WHERE id=?", (SESSION_ID,)).fetchone()[0], 0)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM message WHERE session_id=?", (SESSION_ID,)).fetchone()[0], 0
+        )
+        conn.close()
+
+        receipts = list(self.operations.glob("restore-*/receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "failed")
+
+    def test_process_crash_after_commit_is_recoverable(self):
+        script = (
+            "import os\n"
+            "from zcode_session_rescue import operations\n"
+            "original = operations.atomic_write_json\n"
+            "def crash_on_completed(path, payload):\n"
+            "    if payload.get('status') == 'completed':\n"
+            "        os._exit(9)\n"
+            "    original(path, payload)\n"
+            "operations.atomic_write_json = crash_on_completed\n"
+            f"operations.restore_session({str(self.source)!r}, {str(self.target)!r}, "
+            f"{SESSION_ID!r}, {str(self.operations)!r}, apply=True)\n"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 9, result.stderr)
+
+        receipts = list(self.operations.glob("restore-*/receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "prepared")
+
+        conn = sqlite3.connect(self.target)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session WHERE id=?", (SESSION_ID,)).fetchone()[0], 1)
+        conn.close()
+
+        undo_restore(receipts[0], apply=True)
+        conn = sqlite3.connect(self.target)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM session WHERE id=?", (SESSION_ID,)).fetchone()[0], 0)
+        conn.close()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file name rules")
+    def test_question_mark_in_paths(self):
+        source = create_source_db(self.root / "旧?库.sqlite")
+        target = create_target_db(self.root / "新?库.sqlite")
+        restored = restore_session(source, target, SESSION_ID, self.root / "ops?", apply=True)
+        conn = sqlite3.connect(target)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM message WHERE session_id=?", (SESSION_ID,)).fetchone()[0], 1)
+        conn.close()
+        undo_restore(restored.receipt_path, apply=True)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_backup_and_receipt_are_owner_only(self):
+        restored = restore_session(self.source, self.target, SESSION_ID, self.operations, apply=True)
+        self.assertEqual(os.stat(restored.receipt_path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(restored.backup_path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(restored.operation_dir).st_mode & 0o777, 0o700)
 
 
 if __name__ == "__main__":
